@@ -55,6 +55,40 @@ def ok(cond, name):
         print("  ✗ %s" % name)
 
 
+def _test_cadena_truncada():
+    """N eventos, se borra el último. El prefijo sigue encadenado; el head no.
+    Tiene que fallar y decir truncada, no darlo por íntegro."""
+    import glob
+    aislado = os.path.join(_TMP, "borde_trunc")
+    os.makedirs(aislado)
+    saved = (borde.BORDE_DIR, borde.HEAD_FILE, borde.LOCK_FILE)
+    borde.BORDE_DIR = aislado
+    borde.HEAD_FILE = os.path.join(aislado, "head.txt")
+    borde.LOCK_FILE = os.path.join(aislado, ".lock")
+    try:
+        n = 3
+        for i in range(n):
+            ok(borde._sellar({"evento": "test", "i": i}) is not None, "sello de prueba %d" % i)
+        ok_antes, det_antes = borde.verificar_cadena()
+        ok(ok_antes, "cadena de %d íntegra antes de truncar (%s)" % (n, det_antes))
+        ledgers = sorted(glob.glob(os.path.join(aislado, "ledger-*.jsonl")))
+        lines = open(ledgers[-1], encoding="utf-8").read().splitlines()
+        ok(len(lines) == n, "ledger de prueba tiene %d eventos" % n)
+        open(ledgers[-1], "w", encoding="utf-8").write("\n".join(lines[:-1]) + "\n")
+        ok_t, det_t = borde.verificar_cadena()
+        ok(not ok_t and "truncada" in det_t and "rota" not in det_t,
+           "borrar el último evento es cadena truncada (%s)" % det_t)
+        rec = json.loads(lines[0])
+        rec["i"] = 999
+        lines[0] = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+        open(ledgers[-1], "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        ok_r, det_r = borde.verificar_cadena()
+        ok(not ok_r and "rota" in det_r and "truncada" not in det_r,
+           "alterar un evento es cadena rota, no truncada (%s)" % det_r)
+    finally:
+        borde.BORDE_DIR, borde.HEAD_FILE, borde.LOCK_FILE = saved
+
+
 def main():
     # ── 1. FAIL-CLOSED por sensibilidad ──────────────────────────────────────────────────
     sensibles = [
@@ -519,6 +553,7 @@ def main():
     os.remove(halt)
 
     # ── 4. Integridad de la cadena de traza ──────────────────────────────────────────────
+    _test_cadena_truncada()
     okc, det = borde.verificar_cadena()
     ok(okc, "cadena íntegra tras operar (%s)" % det)
     # alterar un evento → la cadena debe romperse
@@ -529,12 +564,14 @@ def main():
         rec = json.loads(lines[0]); rec["motivo"] = "ALTERADO"
         lines[0] = json.dumps(rec, ensure_ascii=False, sort_keys=True)
         open(ledgers[0], "w", encoding="utf-8").write("\n".join(lines) + "\n")
-        okb, _ = borde.verificar_cadena()
-        ok(not okb, "cadena ROTA tras alterar un evento (detectado)")
-        # borrar el primer evento → salto de secuencia
+        okb, detb = borde.verificar_cadena()
+        ok(not okb and "rota" in detb and "truncada" not in detb,
+           "cadena ROTA tras alterar un evento (%s)" % detb)
+        # borrar el primer evento → salto de secuencia (no es un recorte del final)
         open(ledgers[0], "w", encoding="utf-8").write("\n".join(lines[1:]) + "\n")
-        okd, _ = borde.verificar_cadena()
-        ok(not okd, "cadena ROTA tras borrar un evento (salto de secuencia)")
+        okd, detd = borde.verificar_cadena()
+        ok(not okd and "rota" in detd and "truncada" not in detd,
+           "cadena ROTA tras borrar un evento intermedio (%s)" % detd)
     else:
         ok(False, "había ledger para alterar")
 
