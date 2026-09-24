@@ -174,6 +174,7 @@ runpy test_borde.py
 runpy test_reescribe_consulta.py
 runpy test_deid.py
 runpy test_kb_pdf_avisos.py
+runpy test_kb_pdf_truncado.py
 runpy test_kb_fts5.py
 runpy test_kb_hibrido.py
 runpy test_kb_lock.py

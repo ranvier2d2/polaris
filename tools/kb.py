@@ -126,13 +126,43 @@ def hay_pypdf():
         return False
 
 
+# Tope de extracción. Subirlo es opcional; callarlo no. Un informe más largo se indexa
+# a medias y el registro (doc_meta) lo dice: páginas leídas, vacías, si hubo OCR y si se cortó.
+PDF_MAX_PAGES = 80
+
+
+def leer_pdf(path):
+    """Texto de las primeras PDF_MAX_PAGES páginas y el registro de cobertura.
+
+    kb.py no OCRea: un escaneado sin capa de texto sale como páginas vacías y ocr=False.
+    El sidecar lo hace ocr_informes.py; aquí no se inventa un OCR que no ocurrió.
+    """
+    from pypdf import PdfReader
+    _instalar_contador_pdf()
+    pages = PdfReader(path).pages
+    total = len(pages)
+    leer = pages[:PDF_MAX_PAGES]
+    textos, vacias = [], 0
+    for pg in leer:
+        t = pg.extract_text() or ""
+        if not t.strip():
+            vacias += 1
+        textos.append(t)
+    meta = {
+        "pages_total": total,
+        "pages_read": len(leer),
+        "pages_empty": vacias,
+        "ocr": False,
+        "truncated": total > PDF_MAX_PAGES,
+    }
+    return "\n".join(textos), meta
+
+
 def read_text(path, rel=None):
     if path.lower().endswith(".pdf"):
         _pdf_actual[0] = rel or path
         try:
-            from pypdf import PdfReader
-            _instalar_contador_pdf()
-            return "\n".join((pg.extract_text() or "") for pg in PdfReader(path).pages[:80])
+            return leer_pdf(path)[0]
         except ImportError:
             # No es «este PDF está roto», es «este intérprete no sabe leer NINGÚN PDF». Con el
             # `except Exception` de antes las dos cosas se trataban igual y en silencio: correr
@@ -147,8 +177,8 @@ def read_text(path, rel=None):
     with open(path, encoding="utf-8", errors="ignore") as f:
         return f.read()
 
-def chunk_file(path, rel):
-    lines = read_text(path, rel).splitlines()
+def _trocear(texto, rel):
+    lines = texto.splitlines()
     out, cur, curlen = [], [], 0
     title = os.path.basename(rel); heading = title
     def flush():
@@ -164,6 +194,21 @@ def chunk_file(path, rel):
     flush()
     return out
 
+def chunk_file(path, rel):
+    """(pasajes, meta_pdf | None). La meta solo existe en PDF: cobertura real de la extracción."""
+    if path.lower().endswith(".pdf"):
+        _pdf_actual[0] = rel or path
+        try:
+            texto, meta = leer_pdf(path)
+        except ImportError:
+            raise
+        except Exception:
+            return [], None
+        finally:
+            _pdf_actual[0] = None
+        return _trocear(texto, rel), meta
+    return _trocear(read_text(path, rel), rel), None
+
 # ─── índice FTS5 (primario) ────────────────────────────────────────────────────────────────
 # Solo `body` es indexable/consultable (kb histórico solo tokeniza el texto, no el título).
 # path/title/sensitivity se guardan pero no entran en el MATCH. unicode61 + remove_diacritics 2
@@ -172,6 +217,18 @@ _SCHEMA = (
     "CREATE VIRTUAL TABLE chunks USING fts5("
     "  path UNINDEXED, title UNINDEXED, sensitivity UNINDEXED, body,"
     "  tokenize = 'unicode61 remove_diacritics 2'"
+    ")"
+)
+
+# Cobertura de cada PDF indexado. Tabla normal (no FTS): el MATCH no debe tokenizar estos números.
+_META_SCHEMA = (
+    "CREATE TABLE doc_meta ("
+    "  path TEXT PRIMARY KEY,"
+    "  pages_total INTEGER NOT NULL,"
+    "  pages_read INTEGER NOT NULL,"
+    "  pages_empty INTEGER NOT NULL,"
+    "  ocr INTEGER NOT NULL,"
+    "  truncated INTEGER NOT NULL"
     ")"
 )
 
@@ -296,19 +353,28 @@ def build():
         os.remove(tmp)
     con = sqlite3.connect(tmp)
     con.execute(_SCHEMA)
+    con.execute(_META_SCHEMA)
     _pdf_avisos.clear()   # cuenta fresca de avisos de PDF en cada build() (idempotente)
-    rows, n = [], 0
+    rows, n, pdf_metas = [], 0, []
     for p in sorted(files):
         rel = os.path.relpath(p, FV)
         if rel.startswith("."):
             continue
         try:
-            for heading, text in chunk_file(p, rel):
+            chunks, meta = chunk_file(p, rel)
+            for heading, text in chunks:
                 rows.append((rel, heading, _sensitivity(rel, text), text)); n += 1
+            if meta is not None:
+                pdf_metas.append((rel, meta))
         except Exception:
             pass
     con.executemany(
         "INSERT INTO chunks(path, title, sensitivity, body) VALUES (?,?,?,?)", rows)
+    con.executemany(
+        "INSERT INTO doc_meta(path, pages_total, pages_read, pages_empty, ocr, truncated) "
+        "VALUES (?,?,?,?,?,?)",
+        [(rel, m["pages_total"], m["pages_read"], m["pages_empty"],
+          int(m["ocr"]), int(m["truncated"])) for rel, m in pdf_metas])
     con.commit()
     # `optimize` COMPACTA, no indexa: reescribe el índice FTS5 entero (404 MB a 17-sep-2026)
     # y necesita ~2x en temporal. Cuando eso reventaba con «disk I/O error» se perdía el
@@ -325,6 +391,11 @@ def build():
     os.replace(tmp, DB)   # swap atómico: no corrompe si alguien consulta a la vez
     lock.close()          # sueltas el lock DESPUÉS del swap: hasta aquí el índice no es el nuevo
     print(f"✅ Indexados {n} pasajes de {len(files)} ficheros → .kb_index.db ({os.path.getsize(DB)//1024} KB)")
+    cortados = [rel for rel, m in pdf_metas if m["truncated"]]
+    if cortados:
+        nombres = ", ".join(os.path.basename(p) for p in sorted(cortados))
+        print(f"⚠️  {len(cortados)} PDFs truncados a {PDF_MAX_PAGES} páginas "
+              f"(el resto no entra en el índice; doc_meta lo marca): {nombres}")
     if _pdf_avisos:
         nombres = ", ".join(os.path.basename(p) for p in sorted(_pdf_avisos))
         print(f"⚠️  {len(_pdf_avisos)} PDFs con partes ilegibles (no-fatal, pypdf saltó esos objetos/páginas "
@@ -487,16 +558,56 @@ def retrieve(q, k=6, scope="internal", db_path=None):
         return _retrieve_json(q, k, scope, path)
     return _retrieve_hybrid(q, k, scope, path)
 
+def _metas_pdf(paths, db_path=None):
+    """path → cobertura guardada en doc_meta. Índice viejo o sin la tabla → {} (no se inventa)."""
+    db_path = db_path or DB
+    if not paths or not os.path.exists(db_path):
+        return {}
+    try:
+        con = sqlite3.connect(db_path)
+        if not con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_meta'").fetchone():
+            con.close()
+            return {}
+        marcas = ",".join("?" * len(paths))
+        cur = con.execute(
+            "SELECT path, pages_total, pages_read, pages_empty, ocr, truncated "
+            "FROM doc_meta WHERE path IN (%s)" % marcas, list(paths))
+        out = {}
+        for path, total, leidas, vacias, ocr, truncado in cur:
+            out[path] = {
+                "pages_total": total, "pages_read": leidas, "pages_empty": vacias,
+                "ocr": bool(ocr), "truncated": bool(truncado),
+            }
+        con.close()
+        return out
+    except sqlite3.Error:
+        return {}
+
+
+def _aviso_truncado(meta):
+    if not meta or not meta.get("truncated"):
+        return ""
+    ocr = "con OCR" if meta.get("ocr") else "sin OCR"
+    vacias = ""
+    if meta.get("pages_empty"):
+        vacias = ", %d vacías" % meta["pages_empty"]
+    return "   ⚠ truncado: leídas %d/%d páginas%s, %s" % (
+        meta["pages_read"], meta["pages_total"], vacias, ocr)
+
+
 def ask(q, k=6, scope="internal"):  # default SEGURO: 'internal' = todo menos PII/clínico (private). Lo privado exige --scope private/all explícito.
     rows = retrieve(q, k, scope)
     if not rows:
         if not os.path.exists(DB):
             print("No hay índice. Corre primero: python3 kb.py index"); return
         print("(sin resultados — prueba otras palabras o amplía --scope)"); return
+    metas = _metas_pdf([path for path, _title, _text, _sc in rows])
     print(f"🔎 {len(rows)} pasajes para: «{q}»  (scope: {scope})")
     for rank, (path, title, text, sc) in enumerate(rows, 1):
         snippet = re.sub(r"\s+", " ", text)[:480]
-        print(f"\n[{rank}] {path}  ›  {title}   (rel {sc:.1f})\n    {snippet}")
+        aviso = _aviso_truncado(metas.get(path))
+        print(f"\n[{rank}] {path}  ›  {title}   (rel {sc:.1f}){aviso}\n    {snippet}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ("index", "ask"):
