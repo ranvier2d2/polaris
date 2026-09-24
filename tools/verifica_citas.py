@@ -13,6 +13,10 @@ Solo IDs PÚBLICOS de literatura — CERO PII, no toca el muro.
 
 APIs (todas gratis, sin clave):
   DOI   -> Crossref      https://api.crossref.org/works/{doi}
+           Un 404 de /works NO basta: DataCite y otras agencias no están en ese
+           índice. Se resuelve la agencia en /works/{doi}/agency y solo se acusa
+           si el identificador no existe. Si esa segunda llamada no responde,
+           el estado es no_resoluble, nunca fabricada.
   PMID  -> NCBI eutils   https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi
   NCT   -> ClinicalTrials.gov v2   https://clinicaltrials.gov/api/v2/studies/{nct}
   arXiv -> http://export.arxiv.org/api/query?id_list={id}
@@ -99,6 +103,33 @@ def clasifica(raw):
 
 
 # --- comprobadores por fuente ---
+def _agencia_doi(doi):
+    """Tras un 404 de /works: ¿otra agencia, el servicio mudo, o el DOI no existe?
+
+    Crossref documenta que /works solo indexa sus DOIs; /works/{doi}/agency
+    dice quién lo registró (datacite, medra, crossref…) o 404 si nadie.
+    """
+    code, body = _curl("https://api.crossref.org/works/" + doi + "/agency")
+    if code == 404:
+        return FABRICADA, "identificador no existe", "DOI"
+    if code != 200:
+        return NO_RES, "no se pudo resolver la agencia del DOI (%s)" % (
+            code if code else (body or "")[:60]), "DOI"
+    try:
+        ag = (json.loads(body).get("message") or {}).get("agency") or {}
+        aid = (ag.get("id") or "").strip()
+        label = (ag.get("label") or aid).strip()
+    except Exception:
+        return NO_RES, "respuesta de agencia no legible", "DOI"
+    if not aid:
+        return NO_RES, "la agencia no vino en la respuesta", "DOI"
+    # /works ocultó el registro pero la agencia es Crossref (alias, p.ej.).
+    # No es «no existe»: tampoco hay título que enseñar, así que no se afirma.
+    if aid.lower() == "crossref":
+        return NO_RES, "Crossref conoce el DOI pero no devolvió el registro", "Crossref"
+    return EXISTE, "no está en Crossref; registrado en %s" % label, label
+
+
 def check_doi(doi):
     code, body = _curl("https://api.crossref.org/works/" + doi)
     if code == 200:
@@ -107,8 +138,10 @@ def check_doi(doi):
         except Exception:
             t = ""
         return EXISTE, t or "(sin título)", "Crossref"
+    # 404 aquí solo dice «no está en Crossref». DataCite (y mEDRA, etc.)
+    # responden exactamente así y el DOI es real.
     if code == 404:
-        return FABRICADA, "no encontrada en Crossref", "Crossref"
+        return _agencia_doi(doi)
     return NO_RES, "Crossref no respondió (%s)" % (code if code else body[:60]), "Crossref"
 
 

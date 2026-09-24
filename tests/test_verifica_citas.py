@@ -98,6 +98,67 @@ def main():
         v._CHECKERS.clear()
         v._CHECKERS.update(orig)
 
+    # ── un 404 de Crossref no es una cita inventada (issue #14) ─────────────────
+    # Tres respuestas simuladas, sin red. El 404 de /works se distingue así:
+    #   otra agencia (DataCite) → existe;  la agencia no responde → no_resoluble;
+    #   la agencia también 404 → el identificador no existe.
+    AGENCY_DATACITE = (
+        200,
+        '{"status":"ok","message":{"DOI":"10.48550/arxiv.2303.02917",'
+        '"agency":{"id":"datacite","label":"DataCite"}}}',
+    )
+
+    def _curl_segun(mapa):
+        def _fake(url, accept="application/json"):
+            for trozo, resp in mapa.items():
+                if trozo in url:
+                    return resp
+            raise AssertionError("URL no simulada: %s" % url)
+        return _fake
+
+    orig_curl = v._curl
+    try:
+        v._curl = _curl_segun({
+            "/agency": AGENCY_DATACITE,
+            "/works/": (404, "Resource not found."),
+        })
+        r = v.check_doi("10.48550/arXiv.2303.02917")
+        check("DOI de DataCite NO sale fabricado", r[0] == v.EXISTE)
+        check("y nombra la agencia, no Crossref como fuente", r[2] == "DataCite")
+        check("el detalle dice que no está en Crossref", "no está en Crossref" in r[1])
+
+        v._curl = _curl_segun({
+            "/works/": (None, "curl: (28) Connection timed out"),
+        })
+        r = v.check_doi("10.1234/cae-la-red")
+        check("Crossref mudo → no_resoluble", r[0] == v.NO_RES)
+        check("un fallo de red NUNCA es fabricada", r[0] != v.FABRICADA)
+
+        # /works dice 404 y la segunda llamada (agencia) tampoco responde.
+        v._curl = _curl_segun({
+            "/agency": (None, "curl: (6) Could not resolve host"),
+            "/works/": (404, "Resource not found."),
+        })
+        r = v.check_doi("10.1234/agencia-muda")
+        check("agencia muda tras un 404 → no_resoluble", r[0] == v.NO_RES)
+        check("tampoco ese silencio se lee como fabricada", r[0] != v.FABRICADA)
+
+        v._curl = _curl_segun({
+            "/agency": (404, "Resource not found."),
+            "/works/": (404, "Resource not found."),
+        })
+        r = v.check_doi("10.9999/this-doi-does-not-exist-xyz")
+        check("agencia 404 → el identificador no existe", r[0] == v.FABRICADA)
+
+        v._curl = _curl_segun({
+            "/works/": (200, '{"message":{"title":["Un artículo real"]}}'),
+        })
+        r = v.check_doi("10.1038/s41586-024-07123-4")
+        check("DOI que sí está en Crossref sigue siendo existe", r[0] == v.EXISTE)
+        check("y conserva el título", r[1] == "Un artículo real" and r[2] == "Crossref")
+    finally:
+        v._curl = orig_curl
+
     print("RESULTADO verifica_citas: %d OK, %d fallos" % (_pass, _fail))
     print("✅ FILTRO DE CITAS EN VERDE" if _fail == 0 else "❌ revisar fallos")
     return _fail
