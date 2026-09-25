@@ -27,7 +27,8 @@ Invariantes ROCA (F0 — fijos, simples, testeados en tests/test_borde.py):
      por API externa — los vectores se pueden invertir y reconstruir el texto. Solo modelo
      LOCAL (BGE-M3) a destino local.
   4. TRAZA append-only HASH-CHAINED: cada decisión se sella encadenada; un borrado/alteración
-     rompe la cadena (`verificar_cadena()` lo detecta por salto de secuencia o sello roto). La
+     rompe la cadena (`verificar_cadena()` lo detecta por salto de secuencia, sello roto
+     o un ledger más corto que el head). La
      traza guarda METADATOS, NUNCA el contenido (logs minimizados; solo un sello sha256).
   5. REVOCABILIDAD + anti-replay: una sesión/intención revocada no vuelve a pasar (persistente).
   6. CANARIOS: si un canario sembrado aparece en una salida → exfiltración → DENY + ALARMA
@@ -672,8 +673,21 @@ def _sellar(evento):
 
 def verificar_cadena():
     """(ok, detalle). Re-camina TODAS las trazas en orden y comprueba: secuencia contigua
-    (sin saltos = sin borrados), enlace prev correcto, y hash recalculado. Detecta borrado,
-    reordenado y alteración. Devuelve (False, motivo) al primer fallo."""
+    (sin saltos = sin borrados intermedios), enlace prev correcto, hash recalculado, y que
+    el final (seq y hash) coincida con el head. Un prefijo válido más corto que el head es
+    cadena truncada; un salto, enlace o sello malo es cadena rota. Si alguien recorta el
+    ledger Y reescribe el head a la vez, no queda testigo. Devuelve (False, motivo) al
+    primer fallo.
+
+    El pase va bajo el mismo lock que `_sellar`. Si no, un verify a mitad de sello ve el
+    ledger ya escrito y el head todavía viejo, y lo llama rota."""
+    if os.path.isdir(BORDE_DIR):
+        with _Lock():
+            return _verificar_cadena_dentro()
+    return _verificar_cadena_dentro()
+
+
+def _verificar_cadena_dentro():
     files = sorted(f for f in os.listdir(BORDE_DIR) if f.startswith("ledger-")) \
         if os.path.isdir(BORDE_DIR) else []
     prev, esperado = "GENESIS", 1
@@ -685,15 +699,22 @@ def verificar_cadena():
                 continue
             rec = json.loads(ln)
             if rec.get("seq") != esperado:
-                return False, "salto de secuencia en seq=%s (esperaba %d) — posible borrado" % (
+                return False, "cadena rota: salto de secuencia en seq=%s (esperaba %d)" % (
                     rec.get("seq"), esperado)
             if rec.get("prev") != prev:
-                return False, "enlace roto en seq=%d (prev no coincide)" % esperado
+                return False, "cadena rota: enlace roto en seq=%d (prev no coincide)" % esperado
             h = _hash_rec({k: rec[k] for k in rec if k != "hash"})
             if h != rec.get("hash"):
-                return False, "sello alterado en seq=%d" % esperado
+                return False, "cadena rota: sello alterado en seq=%d" % esperado
             prev, esperado, total = rec["hash"], esperado + 1, total + 1
-    return True, "cadena íntegra (%d eventos)" % total
+    head_seq, head_hash = _read_head()
+    if head_seq == total and head_hash == prev:
+        return True, "cadena íntegra (%d eventos)" % total
+    if head_seq > total:
+        return False, ("cadena truncada: el ledger acaba en seq=%d hash=%s y el head dice "
+                       "seq=%d hash=%s" % (total, prev, head_seq, head_hash))
+    return False, ("cadena rota: el head (seq=%d hash=%s) no coincide con el final del "
+                   "ledger (seq=%d hash=%s)" % (head_seq, head_hash, total, prev))
 
 
 # ── Puerta central de EGRESS ─────────────────────────────────────────────────────────────
