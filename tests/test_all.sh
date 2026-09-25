@@ -168,6 +168,7 @@ runpy test_elegibilidad_ensayos.py
 runpy test_guardian_evals.py
 runpy test_cumbre.py
 runpy test_cumbre_integridad.py
+runpy test_cumbre_carrera.py
 runpy test_cascada_clinica.py
 runpy test_seguimiento.py
 runpy test_seguimiento_carrera.py

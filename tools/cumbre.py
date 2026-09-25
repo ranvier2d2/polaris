@@ -11,9 +11,13 @@ Es COORDINACIÓN / ESTADO («dónde estamos, cuál es el siguiente bloqueo»), *
 clínico ni claims**: el clínico verificado vive en la fuente de verdad; aquí solo se
 referencia (campo `fuente`). **Deciden sus médicos.** Sin dependencias (stdlib).
 """
+import contextlib
+import fcntl
+import functools
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 
 # El estado VIVO (cumbre.json) y la brújula que lee {{TITULAR}} (BRUJULA-NED.md) viven SOLO en casa
@@ -114,6 +118,17 @@ def _valida(payload):
     return payload
 
 
+def _marcar_instalada(path):
+    """Deja constancia de que esta ruta ya tuvo cadena. Sobrevive a borrar el json."""
+    marca = path + ".instalada"
+    if os.path.exists(marca):
+        return
+    tmp = "%s.tmp.%d" % (marca, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("instalada\n")
+    os.replace(tmp, marca)
+
+
 def _write_atomic(path, payload):
     _valida(payload)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -123,13 +138,67 @@ def _write_atomic(path, payload):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+    _marcar_instalada(path)
+
+
+# flock entre procesos y RLock entre hilos. La profundidad evita el auto-bloqueo: load()
+# llama a ensure(), y avanzar() llama a foco() que vuelve a load(), dentro del mismo escritor.
+_CUMBRE_LOCK_DEPTH = 0
+_cumbre_hilo = threading.RLock()
+
+
+@contextlib.contextmanager
+def _cumbre_lock():
+    global _CUMBRE_LOCK_DEPTH
+    _cumbre_hilo.acquire()
+    try:
+        if _CUMBRE_LOCK_DEPTH > 0:
+            _CUMBRE_LOCK_DEPTH += 1
+            try:
+                yield
+            finally:
+                _CUMBRE_LOCK_DEPTH -= 1
+            return
+        os.makedirs(os.path.dirname(CUMBRE), exist_ok=True)
+        fd = open(CUMBRE + ".lock", "a+")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+            _CUMBRE_LOCK_DEPTH = 1
+            try:
+                yield
+            finally:
+                _CUMBRE_LOCK_DEPTH = 0
+        finally:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                fd.close()
+    finally:
+        _cumbre_hilo.release()
+
+
+def _serializado(fn):
+    @functools.wraps(fn)
+    def _w(*a, **kw):
+        with _cumbre_lock():
+            return fn(*a, **kw)
+    return _w
 
 
 def ensure():
-    if not os.path.exists(CUMBRE):
-        d = dict(SEED)
-        d["actualizado"] = _now()
-        _write_atomic(CUMBRE, d)
+    if os.path.exists(CUMBRE):
+        return
+    # El json puede faltar porque nadie instaló todavía, o porque el estado se borró.
+    # La marca la escribe _write_atomic la primera vez que la cadena existe. Si queda
+    # la marca y no el json, resembrar SEED taparía la cadena viva con la semilla vieja.
+    if os.path.exists(CUMBRE + ".instalada"):
+        raise ValueError(
+            "cumbre: %s desapareció tras una instalación. No resiembro la semilla "
+            "(sería la cadena vieja, no el estado que había). Restaura desde "
+            "00_FUENTE-DE-VERDAD/Gestion/BRUJULA-NED.md." % CUMBRE)
+    d = dict(SEED)
+    d["actualizado"] = _now()
+    _write_atomic(CUMBRE, d)
 
 
 def load():
@@ -305,6 +374,14 @@ def add_ruta_candidata(titulo, *, fuente="", veto="pendiente", nota=""):
          "nota": str(nota), "registrada": _now()})
     _save(d)
     return True
+
+
+ensure = _serializado(ensure)
+set_saliente = _serializado(set_saliente)
+avanzar = _serializado(avanzar)
+esperando_desde = _serializado(esperando_desde)
+aparcar = _serializado(aparcar)
+add_ruta_candidata = _serializado(add_ruta_candidata)
 
 
 def estado():
