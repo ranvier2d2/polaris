@@ -74,6 +74,7 @@ def _build_temp_index_with_vectors(tmp):
     con.close()
     mat = np.stack([_fake_vector(body) for (_p, _s, body) in DOCS])
     np.save(vecpath, mat)
+    kb._sellar_manifiesto_hermano(dbpath)
     return dbpath, vecpath
 
 

@@ -22,14 +22,15 @@ COMPAT: `retrieve()` acepta un `db_path`; si termina en `.json` usa el lector BM
 scoring K1=1.5). Lo usan llamadas programáticas con index_path propio (contexto_caso) y los tests.
 
 HÍBRIDO (BM25 + vectorial, capa opcional): además del FTS5 de siempre, `index` calcula
-embeddings locales (tools/kb_embed.py, ONNX egress-0) y los guarda en `.kb_index.vectors.npy`
-(float32, mmap, fila i ↔ rowid i+1 de la tabla FTS5 — mismo orden de inserción). `retrieve()`
-fusiona el ranking BM25 con el ranking por coseno vía RRF (reciprocal rank fusion) ANTES del
-gate de sensibilidad, que se aplica exactamente igual que hoy (recomputa _sensitivity sobre el
-CONTENIDO, nunca se relaja). Si el modelo/vectores no están disponibles (kb_embed.disponible()
-False, o el .npy no existe) → FALLBACK DURO a FTS5 puro (comportamiento de hoy, cero red).
+embeddings locales (tools/kb_embed.py, ONNX egress-0). Base, vectores y manifiesto salen
+JUNTOS como una generación (id + sha256 por fragmento) y se publican con un solo puntero
+atómico (`.kb_index.db.current`). `retrieve()` abre solo esa generación: fila i del .npy
+sigue siendo el rowid i+1, pero si el puntero, el manifiesto o el hash no cuadran, el brazo
+vectorial no corre y la consulta cae a FTS5. La fusión es RRF ANTES del gate de sensibilidad
+(recomputa _sensitivity sobre el CONTENIDO, nunca se relaja). Sin modelo o sin generación
+consistente → FTS5 puro (cero red).
 """
-import sys, os, re, json, math, unicodedata, glob, sqlite3, logging, hashlib
+import sys, os, re, json, math, unicodedata, glob, sqlite3, logging, hashlib, secrets, shutil
 from collections import defaultdict
 
 ROOT = os.environ.get("BTP_REPO") or os.path.expanduser("~/claudecode")  # casa base SIEMPRE: la fuente de verdad y el índice viven ahí (gitignored), nunca en un worktree
@@ -175,15 +176,211 @@ _SCHEMA = (
     ")"
 )
 
+def _hash_fragmento(path, title, body):
+    """sha256 del fragmento que el lector vuelve a calcular. Cambia si el texto o su sitio cambian."""
+    h = hashlib.sha256()
+    h.update((path or "").encode("utf-8"))
+    h.update(b"\0")
+    h.update((title or "").encode("utf-8"))
+    h.update(b"\0")
+    h.update((body or "").encode("utf-8"))
+    return h.hexdigest()
+
+
+def _puntero(db_path):
+    return db_path + ".current"
+
+
+def _raiz_gen(db_path):
+    return db_path + ".gen"
+
+
+def _escribir_meta(con, gen_id):
+    con.execute("CREATE TABLE IF NOT EXISTS kb_meta (generation TEXT NOT NULL)")
+    con.execute("DELETE FROM kb_meta")
+    con.execute("INSERT INTO kb_meta(generation) VALUES (?)", (gen_id,))
+
+
+def _generacion_en_db(db_path):
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        try:
+            row = con.execute("SELECT generation FROM kb_meta LIMIT 1").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    return row[0]
+
+
+def _leer_manifiesto(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    gen = data.get("generation")
+    chunks = data.get("chunks")
+    if not isinstance(gen, str) or not gen or not isinstance(chunks, list):
+        return None
+    by_rowid = {}
+    for c in chunks:
+        if not isinstance(c, dict):
+            return None
+        try:
+            rowid = int(c["rowid"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        sha = c.get("sha256")
+        if not isinstance(sha, str) or len(sha) != 64:
+            return None
+        if rowid in by_rowid:
+            return None
+        by_rowid[rowid] = sha
+    data = dict(data)
+    data["_by_rowid"] = by_rowid
+    return data
+
+
+def _fragmento_cuadra(man, rowid, path, title, body):
+    esperado = man["_by_rowid"].get(int(rowid))
+    if esperado is None:
+        return False
+    return esperado == _hash_fragmento(path, title, body)
+
+
+def _vectores_utilizables(db_path, vec_path, man_path):
+    """True solo si la db, el .npy y el manifiesto son la misma generación y el mismo tamaño."""
+    if not (db_path and vec_path and man_path):
+        return False
+    if not (os.path.isfile(db_path) and os.path.isfile(vec_path) and os.path.isfile(man_path)):
+        return False
+    man = _leer_manifiesto(man_path)
+    if man is None or _generacion_en_db(db_path) != man["generation"]:
+        return False
+    if len(man["_by_rowid"]) != len(man["chunks"]):
+        return False
+    try:
+        import numpy as np
+        nvec = int(np.load(vec_path, mmap_mode="r").shape[0])
+    except Exception:
+        return False
+    if nvec != len(man["chunks"]):
+        return False
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        try:
+            n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return n == nvec
+
+
+def _resolver_indice(db_path):
+    """(db, vec|None, manifest|None). Con puntero, solo esa generación. Si no cuadra, FTS sin vectores."""
+    ptr = _puntero(db_path)
+    if os.path.isfile(ptr):
+        try:
+            gen_id = open(ptr, encoding="utf-8").read().strip()
+        except OSError:
+            gen_id = ""
+        gen_dir = os.path.join(_raiz_gen(db_path), gen_id) if gen_id else ""
+        db = os.path.join(gen_dir, "index.db") if gen_dir else ""
+        vec = os.path.join(gen_dir, "vectors.npy") if gen_dir else ""
+        man_path = os.path.join(gen_dir, "manifest.json") if gen_dir else ""
+        man = _leer_manifiesto(man_path) if man_path else None
+        if (db and os.path.isfile(db) and man and man["generation"] == gen_id
+                and _generacion_en_db(db) == gen_id):
+            if _vectores_utilizables(db, vec, man_path):
+                return db, vec, man_path
+            return db, None, man_path
+        return db_path, None, None
+    man_path = db_path + ".manifest.json"
+    vec = _vector_path_for(db_path)
+    if _vectores_utilizables(db_path, vec, man_path):
+        return db_path, vec, man_path
+    return db_path, None, None
+
+
+def _sellar_manifiesto_hermano(db_path):
+    """Manifiesto + kb_meta para un .db abierto directo (tests). build() publica por puntero."""
+    con = sqlite3.connect(db_path)
+    rows = con.execute(
+        "SELECT rowid, path, title, body FROM chunks ORDER BY rowid").fetchall()
+    gen_id = secrets.token_hex(16)
+    _escribir_meta(con, gen_id)
+    con.commit()
+    con.close()
+    man = {
+        "generation": gen_id,
+        "chunks": [
+            {"rowid": rowid, "sha256": _hash_fragmento(path, title, body)}
+            for rowid, path, title, body in rows
+        ],
+    }
+    man_path = db_path + ".manifest.json"
+    tmp = man_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(man, f)
+    os.replace(tmp, man_path)
+    return man_path
+
+
+def _publicar_generacion(rows, tmp_db, gen_id):
+    """Mueve la db ya cerrada, escribe vectores y manifiesto, y voltea el puntero al final.
+
+    Hasta el os.replace del puntero el lector sigue en la generación anterior. El .db legado
+    (kb.DB) se actualiza después, para quien lo abre por ruta; retrieve() no lo usa si hay puntero.
+    """
+    gen_dir = os.path.join(_raiz_gen(DB), gen_id)
+    os.makedirs(gen_dir, exist_ok=True)
+    db_final = os.path.join(gen_dir, "index.db")
+    os.replace(tmp_db, db_final)
+    vec_final = os.path.join(gen_dir, "vectors.npy")
+    if not _build_vectors(rows, vec_final) and os.path.exists(vec_final):
+        os.remove(vec_final)
+    man = {
+        "generation": gen_id,
+        "chunks": [
+            {"rowid": i + 1, "sha256": _hash_fragmento(rel, title, body)}
+            for i, (rel, title, _sens, body) in enumerate(rows)
+        ],
+    }
+    man_final = os.path.join(gen_dir, "manifest.json")
+    man_tmp = man_final + ".tmp.%d" % os.getpid()
+    with open(man_tmp, "w", encoding="utf-8") as f:
+        json.dump(man, f, ensure_ascii=False)
+    os.replace(man_tmp, man_final)
+    ptr = _puntero(DB)
+    ptr_tmp = "%s.tmp.%d" % (ptr, os.getpid())
+    with open(ptr_tmp, "w", encoding="utf-8") as f:
+        f.write(gen_id)
+    os.replace(ptr_tmp, ptr)
+    legacy_tmp = "%s.pub.%d" % (DB, os.getpid())
+    shutil.copy2(db_final, legacy_tmp)
+    os.replace(legacy_tmp, DB)
+    if os.path.exists(VEC):
+        os.remove(VEC)
+    raiz = _raiz_gen(DB)
+    for nombre in os.listdir(raiz):
+        if nombre != gen_id:
+            shutil.rmtree(os.path.join(raiz, nombre), ignore_errors=True)
+
+
 def _build_vectors(rows, vec_path):
     """Calcula embeddings para `rows` (mismo orden → mismo rowid que la tabla FTS5, 1-indexed)
     y los guarda en vec_path (.npy float32, N×384). Fail-soft TOTAL: si la capa vectorial no
-    está disponible (modelo/deps ausentes) o CUALQUIER cosa falla, no escribe nada y deja el
-    índice en FTS5-puro (retrieve() lo detecta por la ausencia del fichero, ver disponible()
-    de kb_embed) — nunca rompe `index`, que es la vía de siempre."""
+    está disponible (modelo/deps ausentes) o CUALQUIER cosa falla, no escribe nada y devuelve
+    False — la generación se publica igual, solo-FTS5. True solo si el .npy quedó escrito."""
     if not kb_embed.disponible():
         print("ℹ️  Capa vectorial no disponible (onnxruntime/modelo ausentes) — índice solo-FTS5 (fallback normal).")
-        return
+        return False
     import numpy as np
     textos = [body for (_rel, _heading, _sens, body) in rows]
     BATCH = 64
@@ -200,10 +397,12 @@ def _build_vectors(rows, vec_path):
         os.replace(tmp, vec_path)   # swap atómico, igual que el .db
         print(f"✅ Vectores calculados: {mat.shape[0]} pasajes × {mat.shape[1]}-dim → "
               f"{os.path.basename(vec_path)} ({os.path.getsize(vec_path)//1024} KB)")
+        return True
     except Exception as e:
         print(f"⚠️  Capa vectorial: fallo calculando embeddings ({e}) — índice queda solo-FTS5.")
         if os.path.exists(vec_path):
             os.remove(vec_path)   # no dejar un .npy viejo/desincronizado con la DB nueva
+        return False
 
 
 # El historial ordenado (`_PRIVADO_CLINICO/_historial/`) es la copia BUENA de cada informe:
@@ -321,15 +520,20 @@ def build():
     except sqlite3.Error as e:
         print("kb: índice escrito, sin compactar (%s: %s)" % (type(e).__name__, e),
               file=sys.stderr)
+    gen_id = secrets.token_hex(16)
+    _escribir_meta(con, gen_id)
+    con.commit()
     con.close()
-    os.replace(tmp, DB)   # swap atómico: no corrompe si alguien consulta a la vez
-    lock.close()          # sueltas el lock DESPUÉS del swap: hasta aquí el índice no es el nuevo
+    # Db, vectores y manifiesto se escriben ANTES de voltear el puntero. El lock sigue
+    # cogido: nadie publica otra generación en medio. El lector no ve la nueva hasta el
+    # replace del puntero, así que no casa una db nueva con vectores de la anterior.
+    _publicar_generacion(rows, tmp, gen_id)
+    lock.close()
     print(f"✅ Indexados {n} pasajes de {len(files)} ficheros → .kb_index.db ({os.path.getsize(DB)//1024} KB)")
     if _pdf_avisos:
         nombres = ", ".join(os.path.basename(p) for p in sorted(_pdf_avisos))
         print(f"⚠️  {len(_pdf_avisos)} PDFs con partes ilegibles (no-fatal, pypdf saltó esos objetos/páginas "
               f"rotos y siguió con el resto del texto): {nombres}")
-    _build_vectors(rows, VEC)   # capa híbrida opcional — mismo orden de `rows` = mismo rowid FTS5
 
 # FTS5 tiene sintaxis de query propia; el texto crudo del usuario puede romperla. Plegamos con
 # el MISMO toks() y construimos un OR de términos citados (semántica "cualquier término suma").
@@ -389,16 +593,16 @@ def _vector_path_for(db_path):
     base, _ext = os.path.splitext(db_path)
     return base + ".vectors.npy"
 
-def _vector_candidates(q, k, scope, db_path):
-    """Candidatos por coseno YA filtrados por el gate — [(rowid, path, title, body, score)],
-    mayor score = mejor. [] si la capa vectorial no está disponible, el .npy no existe, o
-    db_path no es el índice FTS5 primario (el .npy solo tiene sentido junto a su .db hermano).
-    Fail-soft: cualquier excepción (npy corrupto, mismatch de tamaño…) → [] y retrieve() sigue
-    con BM25 solo — nunca rompe una consulta."""
-    if not kb_embed.disponible() or not os.path.exists(db_path):
+def _vector_candidates(q, k, scope, db_path, vec_path, man_path):
+    """Candidatos por coseno YA filtrados por el gate — [(rowid, path, title, body, score)].
+
+    vec_path/man_path vienen de _resolver_indice: o son la generación del puntero, o None.
+    Si un fragmento no tiene el hash del manifiesto, se tira el brazo entero (no se sirve
+    una fila de otra generación). Fail-soft: cualquier excepción → [] y retrieve() sigue en BM25."""
+    if not vec_path or not man_path or not kb_embed.disponible() or not os.path.exists(db_path):
         return []
-    vec_path = _vector_path_for(db_path)
-    if not os.path.exists(vec_path):
+    man = _leer_manifiesto(man_path)
+    if man is None:
         return []
     try:
         import numpy as np
@@ -418,8 +622,12 @@ def _vector_candidates(q, k, scope, db_path):
             rowid = int(i) + 1   # fila i (0-indexed, orden de build()) ↔ rowid i+1 (FTS5)
             row = con.execute("SELECT path, title, body FROM chunks WHERE rowid=?", (rowid,)).fetchone()
             if row is None:
-                continue
+                con.close()
+                return []
             path, title, body = row
+            if not _fragmento_cuadra(man, rowid, path, title, body):
+                con.close()
+                return []
             if not _allowed(_sensitivity(path, body), scope):   # MURO: idéntico al brazo BM25
                 continue
             out.append((rowid, path, title, body, float(sims[i])))
@@ -446,13 +654,11 @@ def _rrf_fuse(list_a, list_b, k_out, rrf_k=RRF_K):
     ranked = sorted(rrf.items(), key=lambda kv: -kv[1])[:k_out]
     return [(meta[rowid][0], meta[rowid][1], meta[rowid][2], score) for rowid, score in ranked]
 
-def _retrieve_hybrid(q, k, scope, db_path):
-    """BM25 (siempre) + vectorial (si disponible) fusionados por RRF. Si la capa vectorial no
-    aporta candidatos (modelo ausente, .npy ausente, o falla) esto colapsa exactamente a
-    _retrieve_fts5 reordenado por RRF-de-una-sola-rama, que preserva el MISMO orden relativo
-    que el BM25 puro (rrf monótono en el rango) — no hay pérdida de comportamiento hoy."""
+def _retrieve_hybrid(q, k, scope, db_path, vec_path=None, man_path=None):
+    """BM25 (siempre) + vectorial (si la generación cuadra) fusionados por RRF. Sin vectores
+    consistentes colapsa al BM25 de esa misma db — nunca a un .npy de otra generación."""
     bm25 = _fts5_candidates(q, max(k * 4, 40), scope, db_path)
-    vec = _vector_candidates(q, max(k * 4, 40), scope, db_path)
+    vec = _vector_candidates(q, max(k * 4, 40), scope, db_path, vec_path, man_path)
     if not vec:
         return [(path, title, body, score) for (_rowid, path, title, body, score) in bm25[:k]]
     return _rrf_fuse(bm25, vec, k)
@@ -485,12 +691,13 @@ def retrieve(q, k=6, scope="internal", db_path=None):
     path = db_path or DB
     if str(path).endswith(".json"):
         return _retrieve_json(q, k, scope, path)
-    return _retrieve_hybrid(q, k, scope, path)
+    db, vec, man = _resolver_indice(path)
+    return _retrieve_hybrid(q, k, scope, db, vec, man)
 
 def ask(q, k=6, scope="internal"):  # default SEGURO: 'internal' = todo menos PII/clínico (private). Lo privado exige --scope private/all explícito.
     rows = retrieve(q, k, scope)
     if not rows:
-        if not os.path.exists(DB):
+        if not os.path.exists(DB) and not os.path.isfile(_puntero(DB)):
             print("No hay índice. Corre primero: python3 kb.py index"); return
         print("(sin resultados — prueba otras palabras o amplía --scope)"); return
     print(f"🔎 {len(rows)} pasajes para: «{q}»  (scope: {scope})")
